@@ -90,7 +90,7 @@ class FirmwareDeconstructor:
 
     def _calculate_sizes_and_extract(self):
         """
-        Calculates the size of each region and extracts the data.
+        Calculates the size of each region, trims trailing 0xFF bytes, and extracts the data.
         """
         for i, region in enumerate(self.regions):
             start = region['offset']
@@ -107,6 +107,9 @@ class FirmwareDeconstructor:
 
             data = self.firmware[start:end]
 
+            # Trim trailing 0xFF bytes
+            trimmed_data = data.rstrip(b'\xff')
+
             name = region['name']
 
             filename = name.replace(' ', '_')
@@ -118,10 +121,10 @@ class FirmwareDeconstructor:
                 extracted_file_path = os.path.join(self.output_dir, filename)
 
             with open(extracted_file_path, 'wb') as f_out:
-                f_out.write(data)
+                f_out.write(trimmed_data)
 
-            region['size'] = size
-            print(f"Extracted {filename} at offset {hex(start)} with size {hex(size)}")
+            region['size'] = len(trimmed_data)
+            print(f"Extracted {filename} at offset {hex(start)} with size {hex(len(trimmed_data))}")
 
     def _generate_config(self):
         """

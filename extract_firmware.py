@@ -35,6 +35,39 @@ class FirmwareDeconstructor:
         self._calculate_sizes_and_extract()
         self._generate_config()
 
+    def _verify_part(self, region, name, data):
+        """
+        Verifies a single extracted part against its source file.
+        """
+        if not self.source_parts_dir:
+            return
+
+        source_file_path = os.path.join(self.source_parts_dir, name)
+        if not os.path.exists(source_file_path):
+            # Fallback for names that are different in the source directory
+            name = name.replace(' ', '_') + '.bin'
+            source_file_path = os.path.join(self.source_parts_dir, name)
+            if not os.path.exists(source_file_path):
+                print(f"Warning: Source file not found for {name}")
+                return
+
+        source_data = self._read_file(source_file_path)
+
+        # The source file for schema 1 firmware has a 4-byte header that needs to be stripped
+        if 'type' in region and region['type'] == 'firmware' and 'schema' in region and region['schema'] == 1:
+            source_data = source_data[4:]
+
+        if data != source_data:
+            print(f"Error: Verification failed for {name}")
+            # Write both files to disk for inspection
+            with open(os.path.join(self.output_dir, name + '.extracted'), 'wb') as f:
+                f.write(data)
+            with open(os.path.join(self.output_dir, name + '.source'), 'wb') as f:
+                f.write(source_data)
+            exit(1)
+        else:
+            print(f"Verified {name}")
+
     def _find_all_regions(self):
         """
         Finds all known regions in the dump file.
@@ -70,11 +103,13 @@ class FirmwareDeconstructor:
                 else:
                     self.regions.append({'name': name, 'offset': offset, 'type': 'firmware', 'schema': 1, 'prefix': magic.decode('ascii')})
 
-        # Find all DER certificates
+        # Find all DER certificates, but only before the first firmware region
         der_header = b'\x30\x82'
         offset = 0
+        end_of_search = min(r['offset'] for r in self.regions if r.get('type') == 'firmware')
+
         while True:
-            offset = self.firmware.find(der_header, offset)
+            offset = self.firmware.find(der_header, offset, end_of_search)
             if offset == -1:
                 break
 
@@ -110,6 +145,10 @@ class FirmwareDeconstructor:
             # Trim trailing 0xFF bytes
             trimmed_data = data.rstrip(b'\xff')
 
+            # For schema 1 firmware, the actual data starts 8 bytes after the magic number
+            if 'type' in region and region['type'] == 'firmware' and 'schema' in region and region['schema'] == 1:
+                trimmed_data = trimmed_data[8:]
+
             name = region['name']
 
             filename = name.replace(' ', '_')
@@ -122,6 +161,8 @@ class FirmwareDeconstructor:
 
             with open(extracted_file_path, 'wb') as f_out:
                 f_out.write(trimmed_data)
+
+            self._verify_part(region, name, trimmed_data)
 
             region['size'] = len(trimmed_data)
             print(f"Extracted {filename} at offset {hex(start)} with size {hex(len(trimmed_data))}")

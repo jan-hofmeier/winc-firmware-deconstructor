@@ -4,144 +4,142 @@ import re
 import argparse
 import struct
 
-class FirmwareExtractor:
+class FirmwareDeconstructor:
     """
     A tool for deconstructing WINC1500 firmware dump files.
     """
-    def __init__(self, dump_file, output_dir, source_parts_dir):
+    def __init__(self, dump_file, output_dir, source_parts_dir=None):
         self.dump_file = dump_file
-        self.source_parts_dir = source_parts_dir
         self.output_dir = output_dir
+        self.source_parts_dir = source_parts_dir
         self.firmware = self._read_file(dump_file)
-        self.config = self._parse_config()
-        self.extracted_parts = {}
+        self.regions = []
 
     def _read_file(self, file_path):
         """Reads a binary file and returns its content."""
         with open(file_path, 'rb') as f:
             return f.read()
 
-    def _parse_config(self):
+    def deconstruct(self):
         """
-        Parses a flash_image.config file. This is needed for http file
-        extraction and for generating a more complete config file.
-        """
-        config = {}
-        if self.source_parts_dir:
-            for root, dirs, files in os.walk(self.source_parts_dir):
-                for file in files:
-                    if file.endswith('.config'):
-                        with open(os.path.join(root, file), 'r') as f:
-                            current_section = None
-                            for line in f:
-                                line = line.strip()
-                                if not line or line.startswith('#'):
-                                    continue
-
-                                section_match = re.match(r'\[(.*)\]', line)
-                                if section_match:
-                                    current_section = section_match.group(1)
-                                    config[current_section] = {}
-                                elif current_section:
-                                    key_value_match = re.match(r'(\w+(?:\s\w+)*)\s*is\s*(.*)', line)
-                                    if key_value_match:
-                                        key = key_value_match.group(1).strip()
-                                        value = key_value_match.group(2).strip()
-                                        if key in config[current_section]:
-                                            if not isinstance(config[current_section][key], list):
-                                                config[current_section][key] = [config[current_section][key]]
-                                            config[current_section][key].append(value)
-                                        else:
-                                            config[current_section][key] = value
-        return config
-
-    def extract_all(self):
-        """
-        Extracts all known regions from the firmware dump.
+        Deconstructs the firmware dump into its constituent parts.
         """
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
-        self._find_and_extract_firmware_parts()
-        self._find_and_extract_certificates()
-        self._extract_http_files()
+        self._find_all_regions()
+        self._calculate_sizes_and_extract()
         self._generate_config()
 
-    def _find_and_extract_firmware_parts(self):
+    def _find_all_regions(self):
         """
-        Finds and extracts all firmware parts based on their magic numbers.
-        This method requires the source directory to get the size of the parts.
+        Finds all known regions in the dump file.
         """
-        if not self.source_parts_dir:
-            print("Source directory needed for firmware part extraction.")
-            return
+        # Add the fixed regions
+        self.regions.append({'name': 'boot firmware', 'offset': 0x0, 'type': 'firmware', 'schema': 1, 'prefix': 'NMIS'})
+        self.regions.append({'name': 'control sector', 'offset': 0x1000})
+        self.regions.append({'name': 'backup sector', 'offset': 0x2000})
+        self.regions.append({'name': 'pll table', 'offset': 0x3000})
+        self.regions.append({'name': 'gain table', 'offset': 0x3400})
 
-        for section, data in self.config.items():
-            if data.get('type') == 'firmware':
-                self._extract_firmware_part(section, data)
+        # Assert that the boot firmware magic is where we expect it
+        assert self.firmware.find(b'NMIS') == 0x0
 
-    def _extract_firmware_part(self, section, data):
-        name = os.path.basename(data.get('file'))
-        magic = data.get('prefix').encode('ascii')
-        schema = int(data.get('schema', 1))
+        # Find the other firmware parts
+        downloader_offset = self.firmware.find(b'NMIS', 1)
+        assert downloader_offset != -1
+        self.regions.append({'name': 'downloader firmware', 'offset': downloader_offset, 'type': 'firmware', 'schema': 1, 'prefix': 'NMIS'})
 
-        occurrence = 0
-        if section == 'downloader firmware':
-            occurrence = 1
+        wifi_offset = self.firmware.find(b'NMID')
+        assert wifi_offset != -1
+        self.regions.append({'name': 'wifi firmware', 'offset': wifi_offset, 'type': 'firmware', 'schema': 1, 'prefix': 'NMID'})
 
-        source_file_path = os.path.join(self.source_parts_dir, 'firmware', name)
-        if not os.path.exists(source_file_path):
-            print(f"Source file not found: {source_file_path}")
-            return
+        ate_offset = self.firmware.find(b'FTMA')
+        assert ate_offset != -1
+        self.regions.append({'name': 'ate firmware', 'offset': ate_offset, 'type': 'firmware', 'schema': 4, 'prefix': 'FTMA'})
 
-        with open(source_file_path, 'rb') as f_source:
-            source_data_full = f_source.read()
-
-        data_len = len(source_data_full)
-
-        magic_offset = -1
-        for i in range(occurrence + 1):
-            magic_offset = self.firmware.find(magic, magic_offset + 1)
-            if magic_offset == -1:
+        # Find all DER certificates
+        der_header = b'\x30\x82'
+        offset = 0
+        while True:
+            offset = self.firmware.find(der_header, offset)
+            if offset == -1:
                 break
 
-        if magic_offset == -1:
-            print(f"Magic number for {name} (occurrence {occurrence}) not found.")
-            return
+            self.regions.append({'name': f'certificate_{hex(offset)}', 'offset': offset, 'type': 'certificate'})
 
-        dump_data_start = magic_offset
-        dump_data_end = dump_data_start + data_len
+            length_bytes = self.firmware[offset + 2 : offset + 4]
+            length = struct.unpack('>H', length_bytes)[0]
+            offset += 4 + length
 
-        if schema == 4:
-            dump_data_end += 4
+        # The http files region is at a fixed offset
+        self.regions.append({'name': 'http files', 'offset': 0x7000})
 
-        dump_data = self.firmware[dump_data_start:dump_data_end]
+        self.regions.sort(key=lambda x: x['offset'])
 
-        extracted_file_path = os.path.join(self.output_dir, name)
-        with open(extracted_file_path, 'wb') as f_out:
-            f_out.write(dump_data)
+    def _calculate_sizes_and_extract(self):
+        """
+        Calculates the size of each region and extracts the data.
+        """
+        for i, region in enumerate(self.regions):
+            start = region['offset']
+            if i + 1 < len(self.regions):
+                end = self.regions[i+1]['offset']
+            else:
+                end = len(self.firmware)
 
-        self.extracted_parts[section] = {'offset': magic_offset, 'size': len(dump_data)}
-        print(f"Reconstructed {name} at offset {hex(magic_offset)} with size {hex(len(dump_data))}")
+            size = end - start
+            data = self.firmware[start:end]
 
-    def _find_and_extract_certificates(self):
-        # ... (rest of the code is the same as before)
-        pass
+            name = region['name']
 
-    def _extract_http_files(self):
-        # ... (rest of the code is the same as before)
-        pass
+            filename = name.replace(' ', '_')
+            if 'type' in region and region['type'] == 'certificate':
+                filename += '.der'
+            else:
+                filename += '.bin'
+
+            extracted_file_path = os.path.join(self.output_dir, filename)
+            with open(extracted_file_path, 'wb') as f_out:
+                f_out.write(data)
+
+            region['size'] = size
+            print(f"Extracted {filename} at offset {hex(start)} with size {hex(size)}")
 
     def _generate_config(self):
-        # ... (rest of the code is the same as before)
-        pass
+        """
+        Generates a new flash_image.config file based on the extracted regions.
+        """
+        with open(os.path.join(self.output_dir, 'generated_flash_image.config'), 'w') as f:
+            f.write('[flash]\n')
+            f.write('size is 1M\n')
+
+            for region in self.regions:
+                f.write(f"region at {hex(region['offset'])} is [{region['name']}]\n")
+
+            f.write('\n')
+
+            for region in self.regions:
+                name = region['name']
+                f.write(f'[{name}]\n')
+                if 'type' in region:
+                    if region['type'] == 'firmware':
+                        f.write(f"type is firmware\n")
+                        f.write(f"schema is {region['schema']}\n")
+                        f.write(f"prefix is {region['prefix']}\n")
+                        f.write(f"file is {name.replace(' ', '_')}.bin\n")
+                    elif region['type'] == 'certificate':
+                        f.write('type is tls certificate\n')
+                f.write('\n')
+
+        print("\nGenerated flash_image.config")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Extract firmware parts from a dump file.')
+    parser = argparse.ArgumentParser(description='Deconstruct a WINC1500 firmware dump file.')
     parser.add_argument('dump_file', help='The firmware dump file.')
     parser.add_argument('output_dir', help='The directory to write the extracted parts to.')
-    parser.add_argument('source_dir', help='The directory containing the source firmware parts.')
+    parser.add_argument('--source_dir', help='The directory containing the source parts (for verification and naming).')
     args = parser.parse_args()
 
-    extractor = FirmwareExtractor(args.dump_file, args.output_dir, source_parts_dir=args.source_dir)
-    extractor.extract_all()
+    deconstructor = FirmwareDeconstructor(args.dump_file, args.output_dir, source_parts_dir=args.source_dir)
+    deconstructor.deconstruct()

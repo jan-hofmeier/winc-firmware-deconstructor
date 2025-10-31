@@ -27,6 +27,10 @@ class FirmwareDeconstructor:
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
+        certs_dir = os.path.join(self.output_dir, 'certificates')
+        if not os.path.exists(certs_dir):
+            os.makedirs(certs_dir)
+
         self._find_all_regions()
         self._calculate_sizes_and_extract()
         self._generate_config()
@@ -35,28 +39,36 @@ class FirmwareDeconstructor:
         """
         Finds all known regions in the dump file.
         """
-        # Add the fixed regions
+        # Add the fixed regions, as specified in the flash_image.config
         self.regions.append({'name': 'boot firmware', 'offset': 0x0, 'type': 'firmware', 'schema': 1, 'prefix': 'NMIS'})
         self.regions.append({'name': 'control sector', 'offset': 0x1000})
         self.regions.append({'name': 'backup sector', 'offset': 0x2000})
         self.regions.append({'name': 'pll table', 'offset': 0x3000})
         self.regions.append({'name': 'gain table', 'offset': 0x3400})
 
-        # Assert that the boot firmware magic is where we expect it
-        assert self.firmware.find(b'NMIS') == 0x0
+        # Find all occurrences of the firmware magic numbers
+        magic_numbers = {
+            'downloader firmware': b'NMIS',
+            'wifi firmware': b'NMID',
+            'ate firmware': b'FTMA',
+        }
 
-        # Find the other firmware parts
-        downloader_offset = self.firmware.find(b'NMIS', 1)
-        assert downloader_offset != -1
-        self.regions.append({'name': 'downloader firmware', 'offset': downloader_offset, 'type': 'firmware', 'schema': 1, 'prefix': 'NMIS'})
+        for name, magic in magic_numbers.items():
+            occurrence = 0
+            if name == 'downloader firmware':
+                occurrence = 1
 
-        wifi_offset = self.firmware.find(b'NMID')
-        assert wifi_offset != -1
-        self.regions.append({'name': 'wifi firmware', 'offset': wifi_offset, 'type': 'firmware', 'schema': 1, 'prefix': 'NMID'})
+            offset = -1
+            for i in range(occurrence + 1):
+                offset = self.firmware.find(magic, offset + 1)
+                if offset == -1:
+                    break
 
-        ate_offset = self.firmware.find(b'FTMA')
-        assert ate_offset != -1
-        self.regions.append({'name': 'ate firmware', 'offset': ate_offset, 'type': 'firmware', 'schema': 4, 'prefix': 'FTMA'})
+            if offset != -1:
+                if name == 'ate firmware':
+                    self.regions.append({'name': name, 'offset': offset, 'type': 'firmware', 'schema': 4, 'prefix': 'FTMA'})
+                else:
+                    self.regions.append({'name': name, 'offset': offset, 'type': 'firmware', 'schema': 1, 'prefix': magic.decode('ascii')})
 
         # Find all DER certificates
         der_header = b'\x30\x82'
@@ -66,14 +78,13 @@ class FirmwareDeconstructor:
             if offset == -1:
                 break
 
-            self.regions.append({'name': f'certificate_{hex(offset)}', 'offset': offset, 'type': 'certificate'})
-
             length_bytes = self.firmware[offset + 2 : offset + 4]
             length = struct.unpack('>H', length_bytes)[0]
-            offset += 4 + length
+            total_length = 4 + length
 
-        # The http files region is at a fixed offset
-        self.regions.append({'name': 'http files', 'offset': 0x7000})
+            self.regions.append({'name': f'certificate_{hex(offset)}', 'offset': offset, 'size': total_length, 'type': 'certificate'})
+
+            offset += total_length
 
         self.regions.sort(key=lambda x: x['offset'])
 
@@ -83,12 +94,17 @@ class FirmwareDeconstructor:
         """
         for i, region in enumerate(self.regions):
             start = region['offset']
-            if i + 1 < len(self.regions):
+
+            if 'size' in region:
+                size = region['size']
+                end = start + size
+            elif i + 1 < len(self.regions):
                 end = self.regions[i+1]['offset']
+                size = end - start
             else:
                 end = len(self.firmware)
+                size = end - start
 
-            size = end - start
             data = self.firmware[start:end]
 
             name = region['name']
@@ -96,10 +112,11 @@ class FirmwareDeconstructor:
             filename = name.replace(' ', '_')
             if 'type' in region and region['type'] == 'certificate':
                 filename += '.der'
+                extracted_file_path = os.path.join(self.output_dir, 'certificates', filename)
             else:
                 filename += '.bin'
+                extracted_file_path = os.path.join(self.output_dir, filename)
 
-            extracted_file_path = os.path.join(self.output_dir, filename)
             with open(extracted_file_path, 'wb') as f_out:
                 f_out.write(data)
 

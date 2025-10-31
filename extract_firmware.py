@@ -85,7 +85,7 @@ class FirmwareDeconstructor:
             'wifi firmware': b'NMID',
             'ate firmware': b'FTMA',
         }
-
+        wifi_firmware_offset = -1
         for name, magic in magic_numbers.items():
             occurrence = 0
             if name == 'downloader firmware':
@@ -98,28 +98,27 @@ class FirmwareDeconstructor:
                     break
 
             if offset != -1:
+                if name == 'wifi firmware':
+                    wifi_firmware_offset = offset
                 if name == 'ate firmware':
                     self.regions.append({'name': name, 'offset': offset, 'type': 'firmware', 'schema': 4, 'prefix': 'FTMA'})
                 else:
                     self.regions.append({'name': name, 'offset': offset, 'type': 'firmware', 'schema': 1, 'prefix': magic.decode('ascii')})
 
-        # Find all DER certificates, but only before the first firmware region
+        # Find all DER certificates, but only before the wifi firmware
         der_header = b'\x30\x82'
         offset = 0
-        end_of_search = min(r['offset'] for r in self.regions if r.get('type') == 'firmware')
+        end_search = wifi_firmware_offset if wifi_firmware_offset != -1 else len(self.firmware)
 
         while True:
-            offset = self.firmware.find(der_header, offset, end_of_search)
+            offset = self.firmware.find(der_header, offset + 1, end_search)
             if offset == -1:
                 break
 
             length_bytes = self.firmware[offset + 2 : offset + 4]
             length = struct.unpack('>H', length_bytes)[0]
             total_length = 4 + length
-
             self.regions.append({'name': f'certificate_{hex(offset)}', 'offset': offset, 'size': total_length, 'type': 'certificate'})
-
-            offset += total_length
 
         self.regions.sort(key=lambda x: x['offset'])
 
@@ -142,12 +141,11 @@ class FirmwareDeconstructor:
 
             data = self.firmware[start:end]
 
-            # Trim trailing 0xFF bytes
-            trimmed_data = data.rstrip(b'\xff')
-
             # For schema 1 firmware, the actual data starts 8 bytes after the magic number
             if 'type' in region and region['type'] == 'firmware' and 'schema' in region and region['schema'] == 1:
-                trimmed_data = trimmed_data[8:]
+                data = data[8:]
+
+            trimmed_data = data.rstrip(b'\xff')
 
             name = region['name']
 

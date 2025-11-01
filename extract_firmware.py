@@ -35,38 +35,56 @@ class FirmwareDeconstructor:
         self._calculate_sizes_and_extract()
         self._generate_config()
 
+    def _get_source_file_path(self, name):
+        """Resolves the path to a source file, handling naming variations."""
+        if not self.source_parts_dir:
+            return None
+
+        # Check for original name
+        source_file_path = os.path.join(self.source_parts_dir, name)
+        if os.path.exists(source_file_path):
+            return source_file_path
+
+        # Fallback for names with underscores and .bin extension
+        name_fallback = name.replace(' ', '_') + '.bin'
+        source_file_path = os.path.join(self.source_parts_dir, name_fallback)
+        if os.path.exists(source_file_path):
+            return source_file_path
+
+        return None
+
     def _verify_part(self, region, name, data):
         """
         Verifies a single extracted part against its source file.
         """
-        if not self.source_parts_dir:
-            return
+        source_file_path = self._get_source_file_path(name)
 
-        source_file_path = os.path.join(self.source_parts_dir, name)
-        if not os.path.exists(source_file_path):
-            # Fallback for names that are different in the source directory
-            name = name.replace(' ', '_') + '.bin'
-            source_file_path = os.path.join(self.source_parts_dir, name)
-            if not os.path.exists(source_file_path):
-                print(f"Warning: Source file not found for {name}")
-                return
+        if not source_file_path:
+            # Cannot verify if the source file doesn't exist.
+            # Only print a warning if we were expecting to verify this file.
+            if self.source_parts_dir and region.get('type') == 'firmware':
+                print(f"Warning: Source file not found for {name.replace(' ', '_') + '.bin'}")
+            return
 
         source_data = self._read_file(source_file_path)
 
-        # The source file for schema 1 firmware has a 4-byte header that needs to be stripped
-        if 'type' in region and region['type'] == 'firmware' and 'schema' in region and region['schema'] == 1:
+        # For firmware, we compare against the source file with its header stripped.
+        if region.get('type') == 'firmware':
+            # The source file has a 4-byte header, while the dump has an 8-byte header.
+            # Both headers are stripped before comparison.
             source_data = source_data[4:]
 
         if data != source_data:
-            print(f"Error: Verification failed for {name}")
+            print(f"Error: Verification failed for {name.replace(' ', '_') + '.bin'}")
             # Write both files to disk for inspection
-            with open(os.path.join(self.output_dir, name + '.extracted'), 'wb') as f:
+            debug_name = name.replace(' ', '_') + '.bin'
+            with open(os.path.join(self.output_dir, debug_name + '.extracted'), 'wb') as f:
                 f.write(data)
-            with open(os.path.join(self.output_dir, name + '.source'), 'wb') as f:
+            with open(os.path.join(self.output_dir, debug_name + '.source'), 'wb') as f:
                 f.write(source_data)
             exit(1)
         else:
-            print(f"Verified {name}")
+            print(f"Verified {name.replace(' ', '_') + '.bin'}")
 
     def _find_all_regions(self):
         """
@@ -110,8 +128,8 @@ class FirmwareDeconstructor:
         offset = 0
         end_search = wifi_firmware_offset if wifi_firmware_offset != -1 else len(self.firmware)
 
-        while True:
-            offset = self.firmware.find(der_header, offset + 1, end_search)
+        while offset < end_search:
+            offset = self.firmware.find(der_header, offset, end_search)
             if offset == -1:
                 break
 
@@ -119,6 +137,7 @@ class FirmwareDeconstructor:
             length = struct.unpack('>H', length_bytes)[0]
             total_length = 4 + length
             self.regions.append({'name': f'certificate_{hex(offset)}', 'offset': offset, 'size': total_length, 'type': 'certificate'})
+            offset += total_length
 
         self.regions.sort(key=lambda x: x['offset'])
 
@@ -134,18 +153,18 @@ class FirmwareDeconstructor:
                 end = start + size
             elif i + 1 < len(self.regions):
                 end = self.regions[i+1]['offset']
-                size = end - start
             else:
                 end = len(self.firmware)
-                size = end - start
 
             data = self.firmware[start:end]
 
-            # For schema 1 firmware, the actual data starts 8 bytes after the magic number
             if 'type' in region and region['type'] == 'firmware' and 'schema' in region and region['schema'] == 1:
+                # The firmware in the dump has an 8-byte header that needs to be stripped.
                 data = data[8:]
 
             trimmed_data = data.rstrip(b'\xff')
+
+            output_data = trimmed_data
 
             name = region['name']
 
@@ -158,12 +177,12 @@ class FirmwareDeconstructor:
                 extracted_file_path = os.path.join(self.output_dir, filename)
 
             with open(extracted_file_path, 'wb') as f_out:
-                f_out.write(trimmed_data)
+                f_out.write(output_data)
 
-            self._verify_part(region, name, trimmed_data)
+            self._verify_part(region, name, output_data)
 
-            region['size'] = len(trimmed_data)
-            print(f"Extracted {filename} at offset {hex(start)} with size {hex(len(trimmed_data))}")
+            region['size'] = len(output_data)
+            print(f"Extracted {filename} at offset {hex(start)} with size {hex(len(output_data))}")
 
     def _generate_config(self):
         """

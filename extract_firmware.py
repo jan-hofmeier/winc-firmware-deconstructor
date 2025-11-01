@@ -160,7 +160,10 @@ class FirmwareDeconstructor:
 
             if 'type' in region and region['type'] == 'firmware' and 'schema' in region and region['schema'] == 1:
                 # The firmware in the dump has an 8-byte header that needs to be stripped.
-                data = data[8:]
+                h = data[4]-4
+                h = bytes([h])
+                data = h + data[5:]
+
 
             trimmed_data = data.rstrip(b'\xff')
 

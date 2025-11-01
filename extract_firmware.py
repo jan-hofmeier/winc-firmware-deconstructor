@@ -68,11 +68,14 @@ class FirmwareDeconstructor:
 
         source_data = self._read_file(source_file_path)
 
-        # For firmware, we compare against the source file with its header stripped.
+        # For schema 1 firmware, we compare against the source file with its 4-byte header stripped.
         if region.get('type') == 'firmware':
-            # The source file has a 4-byte header, while the dump has an 8-byte header.
-            # Both headers are stripped before comparison.
-            source_data = source_data[4:]
+            if region.get('schema') == 1:
+                source_data = source_data[4:]
+            elif region.get('schema') == 2:
+                # The first byte of the payload in the dump is incremented by 4.
+                data = bytearray(data)
+                data[0] = (data[0] - 4) & 0xFF
 
         if data != source_data:
             print(f"Error: Verification failed for {name.replace(' ', '_') + '.bin'}")
@@ -118,7 +121,8 @@ class FirmwareDeconstructor:
             if offset != -1:
                 if name == 'wifi firmware':
                     wifi_firmware_offset = offset
-                if name == 'ate firmware':
+                    self.regions.append({'name': name, 'offset': offset, 'type': 'firmware', 'schema': 2, 'prefix': 'NMID'})
+                elif name == 'ate firmware':
                     self.regions.append({'name': name, 'offset': offset, 'type': 'firmware', 'schema': 4, 'prefix': 'FTMA'})
                 else:
                     self.regions.append({'name': name, 'offset': offset, 'type': 'firmware', 'schema': 1, 'prefix': magic.decode('ascii')})
@@ -158,9 +162,13 @@ class FirmwareDeconstructor:
 
             data = self.firmware[start:end]
 
-            if 'type' in region and region['type'] == 'firmware' and 'schema' in region and region['schema'] == 1:
-                # The firmware in the dump has an 8-byte header that needs to be stripped.
-                data = data[8:]
+            if region.get('type') == 'firmware' and 'schema' in region:
+                if region['schema'] == 1:
+                    # The firmware in the dump has an 8-byte header that needs to be stripped.
+                    data = data[8:]
+                elif region['schema'] == 2:
+                    # The wifi firmware in the dump has a 4-byte header that needs to be stripped.
+                    data = data[4:]
 
             trimmed_data = data.rstrip(b'\xff')
 
